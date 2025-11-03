@@ -46,11 +46,22 @@ def ingest_astarta(
             st.loc[miss, "station_norm"] = st.loc[miss, "station_raw"].map(mapping["map"]).astype("string")
         st_frames.append(st)
 
-    df_st = pd.concat(st_frames, ignore_index=True) if st_frames else pd.DataFrame(
-        columns=["station_raw","station_norm","dt"]
-    )
+        # concat and CLEAN *df_st* (not data["stations"])
+    df_st = (pd.concat(st_frames, ignore_index=True)
+             if st_frames else pd.DataFrame(columns=["station_raw","station_norm","dt"]))
+
+    # make sure station_norm is populated
+    if "station_norm" not in df_st.columns or df_st["station_norm"].fillna("").str.strip().eq("").all():
+        df_st["station_norm"] = df_st["station_raw"].astype("string").str.strip()
+    else:
+        df_st["station_norm"] = df_st["station_norm"].astype("string").str.strip()
+
+    # ensure proper datetime and dedupe
+    df_st["dt"] = pd.to_datetime(df_st["dt"], errors="coerce")
+    df_st = df_st.dropna(subset=["station_norm", "dt"]).drop_duplicates(["station_norm", "dt"])
 
     return {"ttn": df_ttn, "stations": df_st}
+
 
 def _read_ttn_file(path: Union[str, Path], chunksize: int, tz: str) -> pd.DataFrame:
     """
@@ -213,9 +224,22 @@ def compute_stage_durations(
             continue
         start_series = wide[start_name]
         end_series = wide[next_start_name]
+        # Ensure both series are datetime before computing
+        if not pd.api.types.is_datetime64_any_dtype(start_series):
+            start_series = pd.to_datetime(start_series, errors='coerce')
+        if not pd.api.types.is_datetime64_any_dtype(end_series):
+            end_series = pd.to_datetime(end_series, errors='coerce')
+        
         # Compute durations; keep only positive deltas
         duration = (end_series - start_series)
-        mask = duration.notna() & start_series.notna() & end_series.notna() & (duration.dt.total_seconds() > 0)
+        # Check if duration is a TimedeltaIndex before using .dt
+        if hasattr(duration, 'dt'):
+            duration_seconds = duration.dt.total_seconds()
+        else:
+            # Fallback: convert to timedelta if needed
+            duration_seconds = pd.to_timedelta(duration).dt.total_seconds()
+        
+        mask = duration.notna() & start_series.notna() & end_series.notna() & (duration_seconds > 0)
         if not mask.any():
             continue
         part = pd.DataFrame({
@@ -224,7 +248,14 @@ def compute_stage_durations(
             "start_ts": start_series[mask].values,
             "end_ts": end_series[mask].values,
         })
-        part["duration_s"] = (part["end_ts"] - part["start_ts"]).dt.total_seconds().astype("int64")
+        # Ensure timestamps are datetime before computing duration
+        part["start_ts"] = pd.to_datetime(part["start_ts"], errors='coerce')
+        part["end_ts"] = pd.to_datetime(part["end_ts"], errors='coerce')
+        part = part.dropna(subset=["start_ts", "end_ts"])  # Remove rows where conversion failed
+        
+        # Compute duration using Timedelta
+        timedelta_diff = pd.to_timedelta(part["end_ts"] - part["start_ts"])
+        part["duration_s"] = timedelta_diff.dt.total_seconds().astype("int64")
         part["duration_min"] = (part["duration_s"] / 60.0)
         rows.append(part)
 
