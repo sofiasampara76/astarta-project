@@ -1,3 +1,4 @@
+<pre>
 project-root/
 ├── data/
 │   ├── stations_data/
@@ -7,3 +8,4 @@ project-root/
 │   └── ТТН_data.csv                         # or ТТН_data.xlsx
 ├── validate_data.py
 └── api.py
+</pre>
