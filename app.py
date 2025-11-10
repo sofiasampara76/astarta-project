@@ -102,14 +102,17 @@ else:
 # Charts
 st.header("Overall analysis")
 charts = res.get("charts", {})
-timeline = charts.get("timeline")
-box = charts.get("stage_boxplot")
-thr = charts.get("throughput_hourly")
 
-g1, g2 = st.columns(2)
-if timeline:
-    g1.image(base64.b64decode(timeline), caption="Timeline (sample of first TTNs)", use_container_width=True)
+box = charts.get("stage_boxplot")
+bar = charts.get("bottleneck_barplot")
+cum = charts.get("cumulative_time")
+
+def show_chart(b64img: str, caption: str):
+    st.image(base64.b64decode(b64img), caption=caption, width=1000)
+
 if box:
-    g2.image(base64.b64decode(box), caption="Stage duration distribution (boxplot)", use_container_width=True)
-if thr:
-    st.image(base64.b64decode(thr), caption="Hourly throughput (TTNs completed)", use_container_width=True)
+    show_chart(box, "Stage duration distribution (boxplot)")
+if bar:
+    show_chart(bar, "Average duration by stage (bottleneck visualization)")
+if cum:
+    show_chart(cum, "Cumulative process time (total growth by stage)")

@@ -125,33 +125,6 @@ def _pick_bottleneck(stage_stats: pd.DataFrame) -> Dict[str, Any]:
         "count": int(s_p95.get("count", 0)),
     }
 
-def _gantt_chart(df: pd.DataFrame, max_ttn: int = 20) -> str:
-    # Build simple Gantt per TTN: segment from start to next_start
-    # Assumes df sorted by TTN and order
-    top = (df.groupby("ТТН", sort=False)
-             .head(1)
-             .sort_values("Час реєстрації")
-             .head(max_ttn)["ТТН"]
-             .tolist())
-    sub = df[df["ТТН"].isin(top)].copy()
-    # Build segments
-    fig = plt.figure(figsize=(10, 6))
-    ax = plt.gca()
-    ymap = {ttn:i for i, ttn in enumerate(top)}
-    for ttn, g in sub.groupby("ТТН", sort=False):
-        g = g.sort_values("НомерРядка")
-        for _, r in g.iterrows():
-            start = r["Час реєстрації"]
-            dur = r.get("duration")
-            if pd.isna(start) or pd.isna(dur):
-                continue
-            ax.barh(ymap[ttn], dur.total_seconds()/3600.0, left=pd.Timestamp(start).to_pydatetime(), height=0.4)
-    ax.set_yticks(list(ymap.values()), list(ymap.keys()))
-    ax.set_xlabel("Час")
-    ax.set_ylabel("ТТН")
-    ax.set_title("Process Timeline (приклад перших рейсів)")
-    fig.autofmt_xdate()
-    return _encode_png(fig)
 
 def _boxplot_chart(stage_df: pd.DataFrame) -> str:
     # Boxplot durations by stage
@@ -173,19 +146,37 @@ def _boxplot_chart(stage_df: pd.DataFrame) -> str:
     plt.title("Розподіл тривалості по етапах (без викидів)")
     return _encode_png(fig)
 
-def _throughput_hourly(df_ttn_last: pd.DataFrame) -> str:
-    # Count completed TTNs per hour by last event time
-    if df_ttn_last.empty:
-        fig = plt.figure(figsize=(8,4))
-        plt.title("No completed TTNs")
-        return _encode_png(fig)
-    s = df_ttn_last["Час реєстрації"].dt.floor("h").value_counts().sort_index()
-    fig = plt.figure(figsize=(10,4))
-    plt.plot(s.index.to_pydatetime(), s.values, marker="o")
-    plt.title("Пропускна здатність за годинами (кількість завершень)")
-    plt.xlabel("Година")
-    plt.ylabel("TTN/год")
-    fig.autofmt_xdate()
+def _bottleneck_barplot(stage_df: pd.DataFrame) -> str:
+    # Візуалізація тривалостей по етапах у хвилинах
+    df_stats = (
+        stage_df.groupby("stage")["duration"]
+        .apply(lambda s: s.dt.total_seconds().mean() / 60.0)
+        .reset_index(name="mean_min")
+        .sort_values("mean_min", ascending=False)
+    )
+    fig = plt.figure(figsize=(10, 6))
+    plt.barh(df_stats["stage"], df_stats["mean_min"], color="tomato")
+    plt.xlabel("Середня тривалість, хв")
+    plt.ylabel("Етап")
+    plt.title("Середня тривалість по етапах (чим довше, тим вузьке місце)")
+    plt.gca().invert_yaxis()
+    return _encode_png(fig)
+
+
+def _cumulative_stage_plot(stage_df: pd.DataFrame) -> str:
+    # Кумулятивна сума середніх тривалостей — покаже накопичення часу по процесу
+    df_stats = (
+        stage_df.groupby("stage")["duration"]
+        .apply(lambda s: s.dt.total_seconds().mean() / 60.0)
+        .reset_index(name="mean_min")
+    )
+    df_stats["cum_sum"] = df_stats["mean_min"].cumsum()
+    fig = plt.figure(figsize=(10, 5))
+    plt.plot(df_stats["stage"], df_stats["cum_sum"], marker="o", color="royalblue")
+    plt.xticks(rotation=30, ha="right")
+    plt.ylabel("Накопичений час, хв")
+    plt.title("Кумулятивний час проходження етапів")
+    plt.grid(True, alpha=0.3)
     return _encode_png(fig)
 
 # --------- FastAPI ---------
@@ -224,36 +215,42 @@ async def analyze(file: UploadFile = File(...)) -> AnalyzeResponse:
     df = df.copy()
     df["НомерРядка"] = pd.to_numeric(df["НомерРядка"], errors="coerce")
     df["Час реєстрації"] = _to_dt(df["Час реєстрації"])
-    df = df.dropna(subset=["ТТН","НомерРядка","Час реєстрації"]).sort_values(["ТТН","НомерРядка"])
+    df = df.dropna(subset=["ТТН", "НомерРядка", "Час реєстрації"]).sort_values(["ТТН", "НомерРядка"])
 
-    # Duration = next start - current start within each TTN, as requested
+    # Duration = next start - current start within each TTN
     df["next_start"] = df.groupby("ТТН")["Час реєстрації"].shift(-1)
     df["duration"] = df["next_start"] - df["Час реєстрації"]
-    # Negative/zero durations -> NaT (data issues)
-    df.loc[(df["duration"]<=pd.Timedelta(0)) | (df["duration"].isna()), "duration"] = pd.NaT
+
+    # Remove final stages with no next_start (e.g. "Диспетчер виїзду")
+    df = df[~df["next_start"].isna()].copy()
+
+    # Remove negative or zero durations (data issues)
+    df.loc[(df["duration"] <= pd.Timedelta(0)) | (df["duration"].isna()), "duration"] = pd.NaT
 
     # Stage-level stats
-    stage_df = df.rename(columns={"ТочкаБП":"stage"})
+    stage_df = df.rename(columns={"ТочкаБП": "stage"})
     stats_rows = []
     for stage, g in stage_df.groupby("stage"):
         st = _duration_stats(g["duration"])
         row = {"stage": stage, **st}
-        # Pretty strings
         row["mean"] = _format_seconds(row["mean_s"])
         row["median"] = _format_seconds(row["median_s"])
         row["p90"] = _format_seconds(row["p90_s"])
         row["p95"] = _format_seconds(row["p95_s"])
-        row["std"]  = _format_seconds(row["std_s"])
-        row["iqr"]  = _format_seconds(row["iqr_s"])
-        row["mad"]  = _format_seconds(row["mad_s"])
+        row["std"] = _format_seconds(row["std_s"])
+        row["iqr"] = _format_seconds(row["iqr_s"])
+        row["mad"] = _format_seconds(row["mad_s"])
         stats_rows.append(row)
-    stage_stats = pd.DataFrame(stats_rows).sort_values(["p95_s","median_s","mean_s"], ascending=False, na_position="last")
+
+    stage_stats = pd.DataFrame(stats_rows).sort_values(
+        ["p95_s", "median_s", "mean_s"], ascending=False, na_position="last"
+    )
 
     # Cycle time per TTN (first start to last start)
     cyc = df.groupby("ТТН", as_index=False).agg(
-        first_start=("Час реєстрації","min"),
-        last_start=("Час реєстрації","max"),
-        n_events=("ТочкаБП","count"),
+        first_start=("Час реєстрації", "min"),
+        last_start=("Час реєстрації", "max"),
+        n_events=("ТочкаБП", "count"),
     )
     cyc["cycle_time"] = cyc["last_start"] - cyc["first_start"]
     cyc_valid = cyc.dropna(subset=["cycle_time"])
@@ -264,8 +261,12 @@ async def analyze(file: UploadFile = File(...)) -> AnalyzeResponse:
         "events_count": int(df.shape[0]),
         "period_start": str(df["Час реєстрації"].min()),
         "period_end": str(df["Час реєстрації"].max()),
-        "cycle_time_mean": _format_seconds(cyc_valid["cycle_time"].dt.total_seconds().mean() if not cyc_valid.empty else None),
-        "cycle_time_median": _format_seconds(cyc_valid["cycle_time"].dt.total_seconds().median() if not cyc_valid.empty else None),
+        "cycle_time_mean": _format_seconds(
+            cyc_valid["cycle_time"].dt.total_seconds().mean() if not cyc_valid.empty else None
+        ),
+        "cycle_time_median": _format_seconds(
+            cyc_valid["cycle_time"].dt.total_seconds().median() if not cyc_valid.empty else None
+        ),
     }
 
     # Bottleneck
@@ -273,41 +274,37 @@ async def analyze(file: UploadFile = File(...)) -> AnalyzeResponse:
 
     # Charts
     try:
-        gantt_b64 = _gantt_chart(df)
-    except Exception:
-        # Fallback empty figure
-        fig = plt.figure(figsize=(6,3))
-        plt.title("Timeline unavailable")
-        gantt_b64 = _encode_png(fig)
-
-    try:
         box_b64 = _boxplot_chart(stage_df)
     except Exception:
-        fig = plt.figure(figsize=(6,3))
+        fig = plt.figure(figsize=(6, 3))
         plt.title("Boxplot unavailable")
         box_b64 = _encode_png(fig)
 
     try:
-        # Throughput by hour using last event per TTN
-        last_events = df.sort_values("Час реєстрації").groupby("ТТН").tail(1)
-        thr_b64 = _throughput_hourly(last_events)
+        bar_b64 = _bottleneck_barplot(stage_df)
     except Exception:
-        fig = plt.figure(figsize=(6,3))
-        plt.title("Throughput unavailable")
-        thr_b64 = _encode_png(fig)
+        fig = plt.figure(figsize=(6, 3))
+        plt.title("Barplot unavailable")
+        bar_b64 = _encode_png(fig)
 
-    # Prepare stage_table (pretty)
-    display_cols = ["stage","count","mean","median","p90","p95","std","iqr","mad"]
+    try:
+        cum_b64 = _cumulative_stage_plot(stage_df)
+    except Exception:
+        fig = plt.figure(figsize=(6, 3))
+        plt.title("Cumulative plot unavailable")
+        cum_b64 = _encode_png(fig)
+
+    # Prepare stage_table
+    display_cols = ["stage", "count", "mean", "median", "p90", "p95", "std", "iqr", "mad"]
     stage_table = stage_stats.fillna("").reindex(columns=display_cols).to_dict(orient="records")
 
-    payload = {
-        "summary": summ,
-        "stage_table": stage_table,
-        "bottleneck": bottleneck,
-        "charts": {
-            "timeline": gantt_b64,
+    return AnalyzeResponse(
+        summary=summ,
+        stage_table=stage_table,
+        bottleneck=bottleneck,
+        charts={
+            "bottleneck_barplot": bar_b64,
             "stage_boxplot": box_b64,
-            "throughput_hourly": thr_b64
-        }
-    }
-    return AnalyzeResponse(**payload)
+            "cumulative_time": cum_b64,
+        },
+    )
